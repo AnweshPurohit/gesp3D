@@ -217,7 +217,7 @@ class Pyramid(ParticleShape):
         offset = self.size / 2.0
         points = []
         steps = np.linspace(-offset, offset, 25)
-        # Base edges
+        # Base edges 
         for s in steps:
             points.append([s, -offset, offset]); points.append([s, -offset, -offset])
             points.append([offset, -offset, s]); points.append([-offset, -offset, s])

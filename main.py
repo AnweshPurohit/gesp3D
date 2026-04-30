@@ -237,6 +237,54 @@ class Pyramid(ParticleShape):
                 points.append([loop_offset, loop_y, s]); points.append([-loop_offset, loop_y, s])
         return np.array(points)
 
+class BifurSystem(ParticleShape):
+    def __init__(self, size=200):
+        super().__init__(size)
+        self.num_particles = 10000 # Optimized for 60FPS
+        self.dt = 0.05
+        self.b = 0.20818
+        self.spread = 0.0
+        self.particles = (np.random.rand(self.num_particles, 3) - 0.5) * 10.0
+        
+    def project_points(self, center_pos, scale, rotation_matrix, divisions=1, view_distance=1000):
+        effective_b = self.b * (1.0 - self.spread * 0.5)
+        pos = self.particles
+        
+        # RK2 Integration (2x faster than RK4, maintains chaotic stability)
+        k1_x = np.sin(pos[:, 1]) - effective_b * pos[:, 0]
+        k1_y = np.sin(pos[:, 2]) - effective_b * pos[:, 1]
+        k1_z = np.sin(pos[:, 0]) - effective_b * pos[:, 2]
+        k1 = np.column_stack((k1_x, k1_y, k1_z))
+        
+        pos_k2 = pos + k1 * self.dt
+        k2_x = np.sin(pos_k2[:, 1]) - effective_b * pos_k2[:, 0]
+        k2_y = np.sin(pos_k2[:, 2]) - effective_b * pos_k2[:, 1]
+        k2_z = np.sin(pos_k2[:, 0]) - effective_b * pos_k2[:, 2]
+        k2 = np.column_stack((k2_x, k2_y, k2_z))
+        
+        self.particles += (k1 + k2) * (self.dt * 0.5)
+        
+        dists = np.linalg.norm(self.particles, axis=1, keepdims=True)
+        mask = (dists > 0.01).flatten()
+        self.particles[mask] += (self.particles[mask] / dists[mask]) * self.spread * 0.05
+        
+        out_of_bounds = dists.flatten() > 12.0
+        num_out = np.sum(out_of_bounds)
+        if num_out > 0:
+            self.particles[out_of_bounds] = (np.random.rand(num_out, 3) - 0.5) * 8.0
+
+        visual_scale = scale * (self.size / 6.0) 
+        rotated = self.particles @ rotation_matrix.T
+        rotated *= visual_scale
+        z_coords = rotated[:, 2]
+        depth_denom = view_distance + z_coords
+        depth_denom[depth_denom <= 0] = 0.0001
+        factors = view_distance / depth_denom
+        x_2d = rotated[:, 0] * factors + center_pos[0]
+        y_2d = rotated[:, 1] * factors + center_pos[1]
+        
+        return np.column_stack((x_2d, y_2d, z_coords, self.particles[:, 0]))
+
 def get_rotation_matrix(pitch, yaw, roll):
     cx, sx = np.cos(pitch), np.sin(pitch)
     cy, sy = np.cos(yaw),   np.sin(yaw)
@@ -291,26 +339,42 @@ class CommandConsole:
 # --- Sandbox Logic ---
 
 def run_sandbox(command_queue, log_queue, stop_event):
-    cap = cv2.VideoCapture(0); cap.set(cv2.CAP_PROP_BUFFERSIZE, 1); cap.set(3, WIDTH); cap.set(4, HEIGHT)
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FPS, 60) # Request 60 FPS from hardware
+    cap.set(3, WIDTH); cap.set(4, HEIGHT)
     if not cap.isOpened(): log_queue.put("[ERR]: Webcam not found."); return
     try: detector = HandTracker()
     except Exception as e: log_queue.put(f"[ERR]: Detector failed: {e}"); return
 
+    bifur_sys = BifurSystem(size=250)
     shapes = {"cube": Cube(size=250), "sphere": Sphere(size=250), "pyramid": Pyramid(size=250)}
+    current_mode = "shapes"
     current_shape_name = "cube"; active_shape = shapes[current_shape_name]
     curr_cx, curr_cy = WIDTH / 2.0, HEIGHT / 2.0
     curr_scale, curr_roll, curr_pitch, curr_yaw, curr_divs = 1.0, 0.0, 0.0, 0.0, 1.0 
     holding = False; base_dist, base_scale = 1.0, 1.0; prev_time = 0
     target_offset_pitch, target_offset_yaw = 0.0, 0.0
+    frame_buffer = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
     
     while not stop_event.is_set():
         try:
             while not command_queue.empty():
                 cmd = command_queue.get_nowait().lower()
-                if cmd == "/options": log_queue.put("[SYS]: /cube, /sphere, /pyramid, /side <side>, /reset, /exit")
-                elif cmd == "/cube": current_shape_name = "cube"; active_shape = shapes["cube"]; log_queue.put("[SYS]: Cube Active")
-                elif cmd == "/sphere": current_shape_name = "sphere"; active_shape = shapes["sphere"]; log_queue.put("[SYS]: Sphere Active")
-                elif cmd in ["/pyramid", "/triangle"]: current_shape_name = "pyramid"; active_shape = shapes["pyramid"]; log_queue.put("[SYS]: Pyramid Active")
+                if cmd == "/options": log_queue.put("[SYS]: /mode, /cube, /sphere, /pyramid, /side <side>, /reset, /exit")
+                elif cmd == "/mode": log_queue.put("[SYS]: Available modes: shapes, bifur. Type '/mode <name>'")
+                elif cmd.startswith("/mode "):
+                    mode = cmd.split(" ")[1] if len(cmd.split(" ")) > 1 else ""
+                    if mode == "bifur":
+                        current_mode = "bifur"; current_shape_name = "bifur"; active_shape = bifur_sys
+                        log_queue.put("[SYS]: BIFUR Mode Active")
+                    elif mode == "shapes":
+                        current_mode = "shapes"; current_shape_name = "cube"; active_shape = shapes["cube"]
+                        log_queue.put("[SYS]: SHAPES Mode Active")
+                    else: log_queue.put("[SYS]: Unknown mode. Use shapes or bifur.")
+                elif current_mode == "shapes" and cmd == "/cube": current_shape_name = "cube"; active_shape = shapes["cube"]; log_queue.put("[SYS]: Cube Active")
+                elif current_mode == "shapes" and cmd == "/sphere": current_shape_name = "sphere"; active_shape = shapes["sphere"]; log_queue.put("[SYS]: Sphere Active")
+                elif current_mode == "shapes" and cmd in ["/pyramid", "/triangle"]: current_shape_name = "pyramid"; active_shape = shapes["pyramid"]; log_queue.put("[SYS]: Pyramid Active")
                 elif cmd.startswith("/side "):
                     side = cmd.split(" ")[1] if len(cmd.split(" ")) > 1 else ""
                     if side == "front": target_offset_pitch, target_offset_yaw = 0, 0
@@ -326,8 +390,18 @@ def run_sandbox(command_queue, log_queue, stop_event):
 
         success, img = cap.read()
         if not success: break
-        img = cv2.flip(img, 1); black_bg = np.zeros_like(img); hands = detector.find_hands(img)
+        img = cv2.flip(img, 1)
+        hands = detector.find_hands(img)
         
+        if current_mode == "bifur":
+            if len(hands) > 0:
+                frame_buffer = np.zeros_like(frame_buffer)
+            else:
+                frame_buffer = cv2.addWeighted(frame_buffer, 0.85, np.zeros_like(frame_buffer), 0.15, 0)
+            black_bg = frame_buffer.copy()
+        else:
+            black_bg = np.zeros_like(img)
+            
         t_pitch, t_yaw, t_roll = curr_pitch * 0.95, curr_yaw * 0.95, curr_roll 
         t_cx, t_cy, t_scale, t_divs = curr_cx, curr_cy, curr_scale, 1.0
 
@@ -361,6 +435,10 @@ def run_sandbox(command_queue, log_queue, stop_event):
             if abs(t_pitch) < 0.04: t_pitch = 0.0 
             if pinched1 and pinched2: t_divs = min(6, max(1, (dist - 100) / 40.0))
             
+            if current_mode == "bifur":
+                if pinched1: bifur_sys.spread = min(1.0, bifur_sys.spread + 0.05)
+                else: bifur_sys.spread = max(0.0, bifur_sys.spread - 0.05)
+            
             # Feedback Drawing
             draw_skeleton(black_bg, lms_l, (20, 20, 20))
             draw_skeleton(black_bg, lms_r, (20, 20, 20))
@@ -387,15 +465,24 @@ def run_sandbox(command_queue, log_queue, stop_event):
             mask = (xs >= 0) & (xs < WIDTH) & (ys >= 0) & (ys < HEIGHT)
             v_xs, v_ys, v_zs = xs[mask], ys[mask], zs[mask]
             if len(v_xs) > 0:
-                z_min, z_max = v_zs.min(), v_zs.max()
-                if z_max == z_min: z_max += 1
-                bins = np.linspace(z_max, z_min, 12)
-                for i in range(len(bins)-1):
-                    layer = (v_zs <= bins[i]) & (v_zs > bins[i+1])
-                    if not np.any(layer): continue
-                    avg_z = (bins[i] + bins[i+1]) / 2; val = int(max(0, min(255, 128 + avg_z * 0.5)))
-                    color = (val, 255, 255 - val//2) if holding else (255, val, 255 - val)
-                    for px, py in zip(v_xs[layer], v_ys[layer]): cv2.circle(black_bg, (px, py), 1 if avg_z > 0 else 2, color, -1)
+                if current_mode == "bifur":
+                    orig_xs = projected[:, 3][mask]
+                    mix_factors = np.clip((orig_xs + 10.0) / 20.0, 0, 1)
+                    color_A = np.array([0, 136, 255]) # Orange BGR
+                    color_B = np.array([255, 255, 0]) # Cyan BGR
+                    colors = color_A * (1 - mix_factors[:, None]) + color_B * mix_factors[:, None]
+                    frame_buffer[v_ys, v_xs] = colors.astype(np.uint8)
+                    black_bg = frame_buffer.copy()
+                else:
+                    z_min, z_max = v_zs.min(), v_zs.max()
+                    if z_max == z_min: z_max += 1
+                    bins = np.linspace(z_max, z_min, 12)
+                    for i in range(len(bins)-1):
+                        layer = (v_zs <= bins[i]) & (v_zs > bins[i+1])
+                        if not np.any(layer): continue
+                        avg_z = (bins[i] + bins[i+1]) / 2; val = int(max(0, min(255, 128 + avg_z * 0.5)))
+                        color = (val, 255, 255 - val//2) if holding else (255, val, 255 - val)
+                        for px, py in zip(v_xs[layer], v_ys[layer]): cv2.circle(black_bg, (px, py), 1 if avg_z > 0 else 2, color, -1)
 
         cv2.putText(black_bg, f"SHAPE: {current_shape_name.upper()}", (15, HEIGHT-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
         fps = int(1/(time.time()-prev_time)) if prev_time else 0; prev_time = time.time()
